@@ -20,9 +20,9 @@ USE_COLOR = sys.stdout.isatty()
 RESET = "\033[0m" if USE_COLOR else ""
 COL = (
     {"b": "\033[1m", "d": "\033[2m", "r": "\033[31m", "g": "\033[32m",
-     "y": "\033[33m", "c": "\033[36m", "rev": "\033[7m"}
+     "y": "\033[33m", "c": "\033[36m", "o": "\033[38;5;208m", "rev": "\033[7m"}
     if USE_COLOR
-    else {k: "" for k in ("b", "d", "r", "g", "y", "c", "rev")}
+    else {k: "" for k in ("b", "d", "r", "g", "y", "c", "o", "rev")}
 )
 
 
@@ -31,6 +31,10 @@ def clr(code, text):
 
 
 BOLD_RED = "\033[1m\033[31m" if USE_COLOR else ""
+TP_MULT = Decimal("1.2")
+DOUBLE_SPACE_SEC = 0.3
+CONSTRUCTIONS = ((0, "Стреддл"), (1, "Стренгл ±1"), (2, "Стренгл ±2"), (3, "Стренгл ±3"))
+DESC_W = 30
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,9 @@ class State:
         self.placed = False
         self.follow = False
         self.last_amend = {}
-        self.straddle_done = False
+        self.assembled = False
+        self.constr_idx = 0
+        self.market_done = False
 
     def msg(self, kind, text):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -244,15 +250,35 @@ def apply_order_update(state, d):
                 state.msg("info", f"{sym} отменена (исполнено {o['filled'] or 0})")
             elif st == "Rejected":
                 state.msg("err", f"{sym} отклонена: {o['reject']}")
-        if st == "Filled" and not state.straddle_done and state.orders and \
-                all(oo.get("status") == "Filled" for oo in state.orders.values()):
-            state.straddle_done = True
-            state.follow = False
-            state.msg("ok", "стредд собран — следование выкл")
+        if st == "Filled" and not state.assembled and state.orders:
+            tracked = [oo for oo in state.orders.values()
+                       if oo.get("status") not in ("Cancelled", "PartiallyFilledCanceled", "Не найден")]
+            if tracked and all(oo.get("status") == "Filled" for oo in tracked):
+                state.assembled = True
+                state.follow = False
+                state.msg("ok", "конструкция собрана — следование выкл")
 
 
 def atm_strike(series, index):
     return min(series.strikes, key=lambda s: abs(Decimal(s) - index))
+
+
+def strangle_strikes(series, index, step):
+    i = series.strikes.index(atm_strike(series, index))
+    if i - step < 0 or i + step >= len(series.strikes):
+        return None
+    return series.strikes[i - step], series.strikes[i + step]
+
+
+def construction_legs(series, index, step):
+    atm = atm_strike(series, index)
+    if step == 0:
+        return series.by_strike[atm]["C"], series.by_strike[atm]["P"]
+    sp = strangle_strikes(series, index, step)
+    if sp is None:
+        return None
+    k_p, k_c = sp
+    return series.by_strike[k_c]["C"], series.by_strike[k_p]["P"]
 
 
 def limit_price(leg, t):
@@ -272,22 +298,25 @@ def do_place(cfg, state, series, http):
     with state.lock:
         index = state.index_price
         snap = dict(state.tickers)
+        constr = state.constr_idx
         if state.placed:
             return
     if index is None:
         state.msg("err", "нет индексной цены — выставка отменена")
         return
-    strike = atm_strike(series, index)
+    legs = construction_legs(series, index, CONSTRUCTIONS[constr][0])
+    if legs is None:
+        state.msg("err", f"{CONSTRUCTIONS[constr][1]}: плечи вне сетки страйков — выставка отменена")
+        return
     plan = []
-    for kind in ("C", "P"):
-        leg = series.by_strike[strike][kind]
+    for leg in legs:
         t = snap.get(leg.symbol)
         if not t:
             state.msg("err", f"нет данных по {leg.symbol} — выставка отменена")
             return
         p, err = limit_price(leg, t)
         if err:
-            state.msg("err", f"{kind}{strike}: {err} — выставка отменена")
+            state.msg("err", f"{leg.symbol}: {err} — выставка отменена")
             return
         plan.append((leg, p, t))
     basket_mark = sum((t["mark"] for _, _, t in plan), Decimal(0))
@@ -305,6 +334,7 @@ def do_place(cfg, state, series, http):
                 "symbol": leg.symbol, "tick": str(leg.tick),
                 "price": fmt_price(p, tick), "price_d": str(p),
                 "qty": fmt_qty(cfg.qty, leg.qty_step), "qty_d": str(cfg.qty),
+                "type": "Limit",
                 "status": "Отправлен…" if cfg.live else "DRY — не отправлен",
                 "avg": "", "filled": "", "reject": "",
             }
@@ -361,10 +391,122 @@ def do_cancel_own(cfg, state, http):
                 state.orders[lid]["status"] = "Cancelled"
 
 
+def place_market(cfg, state, http, items):
+    tag = "LIVE" if cfg.live else "DRY"
+    base_lid = f"fm{int(time.time() * 1000)}"
+    placed = []
+    for leg, qty in items:
+        lid = f"{base_lid}{'c' if leg.is_call else 'p'}"
+        placed.append((lid, leg, qty))
+        state.msg("ok" if cfg.live else "info",
+                  f"[{tag}] BUY {fmt_qty(qty, leg.qty_step)} {leg.symbol} по рынку (id {lid})")
+    with state.lock:
+        for lid, leg, qty in placed:
+            state.orders[lid] = {
+                "symbol": leg.symbol, "tick": str(leg.tick),
+                "price": "", "price_d": "",
+                "qty": fmt_qty(qty, leg.qty_step), "qty_d": str(qty),
+                "type": "Market",
+                "status": "Отправлен…" if cfg.live else "DRY — не отправлен",
+                "avg": "", "filled": "", "reject": "",
+            }
+        state.placed = True
+        state.market_done = True
+        state.follow = False
+    if not cfg.live:
+        return
+    for lid, leg, qty in placed:
+        try:
+            http.place_order(
+                category="option", symbol=leg.symbol, side="Buy", orderType="Market",
+                qty=str(qty), orderLinkId=lid)
+        except Exception as e:
+            state.msg("err", f"place market {leg.symbol}: {e!r}")
+            with state.lock:
+                state.orders[lid]["status"] = "ОШИБКА"
+
+
+def do_market_entry(cfg, state, series, http):
+    with state.lock:
+        index = state.index_price
+        constr = state.constr_idx
+        if state.placed:
+            return
+    if index is None:
+        state.msg("err", "нет индексной цены — выставка отменена")
+        return
+    legs = construction_legs(series, index, CONSTRUCTIONS[constr][0])
+    if legs is None:
+        state.msg("err", f"{CONSTRUCTIONS[constr][1]}: плечи вне сетки страйков — выставка отменена")
+        return
+    place_market(cfg, state, http, [(leg, cfg.qty) for leg in legs])
+
+
+def do_market_replace(cfg, state, http, legs):
+    with state.lock:
+        market_done = state.market_done
+        orders = {lid: dict(o) for lid, o in state.orders.items()}
+    if market_done:
+        state.msg("info", "рыночные ордера уже отправлены")
+        return
+    act = {lid: o for lid, o in orders.items() if o.get("status") not in TERMINAL_STATUSES}
+    if not act:
+        state.msg("info", "нет активных лимитных ордеров — конвертация невозможна")
+        return
+    items = []
+    for lid, o in sorted(act.items()):
+        leg = legs.get(o["symbol"])
+        if leg is None:
+            continue
+        filled = dec(o.get("filled")) or Decimal(0)
+        qty = (cfg.qty - filled) / leg.qty_step
+        qty = qty.to_integral_value(rounding=ROUND_FLOOR) * leg.qty_step
+        if qty > 0:
+            items.append((leg, qty))
+    if not cfg.live:
+        with state.lock:
+            for lid in act:
+                state.orders[lid]["status"] = "Cancelled"
+        state.msg("info", "[DRY] лимитные ордера заменены рыночными")
+    else:
+        failed = False
+        for lid, o in sorted(act.items()):
+            try:
+                http.cancel_order(category="option", symbol=o["symbol"], orderLinkId=lid)
+            except Exception as e:
+                if order_gone(str(e)):
+                    state.msg("info", f"{lid}: уже не активен (исполнен или снят)")
+                    with state.lock:
+                        state.orders[lid]["status"] = "Не найден"
+                else:
+                    state.msg("err", f"cancel {lid}: {e!r}")
+                    failed = True
+            else:
+                with state.lock:
+                    state.orders[lid]["status"] = "Cancelled"
+        if failed:
+            state.msg("err", "конвертация прервана: не все лимитные ордера отменены")
+            return
+    if not items:
+        with state.lock:
+            state.market_done = True
+            state.follow = False
+        state.msg("info", "лимитные ордера исполнены полностью — рынок не нужен")
+        return
+    place_market(cfg, state, http, items)
+
+
 def active_orders(state):
     with state.lock:
         return {lid: dict(o) for lid, o in state.orders.items()
                 if o.get("status") not in TERMINAL_STATUSES}
+
+
+def active_limit_orders(state):
+    with state.lock:
+        return {lid: dict(o) for lid, o in state.orders.items()
+                if o.get("status") not in TERMINAL_STATUSES
+                and o.get("type", "Limit") == "Limit"}
 
 
 def do_amend(cfg, state, http, lid, o, p):
@@ -392,7 +534,7 @@ def do_amend(cfg, state, http, lid, o, p):
 
 
 def do_follow_tick(cfg, state, http, legs):
-    act = active_orders(state)
+    act = active_limit_orders(state)
     if not act:
         if state.follow:
             state.follow = False
@@ -420,9 +562,9 @@ def do_follow_tick(cfg, state, http, legs):
 
 def do_update(cfg, state, http, legs):
     if not state.placed:
-        state.msg("err", "стредд не выставлен — сначала ПРОБЕЛ")
+        state.msg("err", "конструкция не выставлена — сначала ПРОБЕЛ")
         return
-    act = active_orders(state)
+    act = active_limit_orders(state)
     if not act:
         state.msg("info", "нет активных ордеров")
         return
@@ -525,7 +667,19 @@ def read_key(timeout):
         if not ch:
             time.sleep(timeout)
             return None
-        return ch.decode("utf-8", "ignore")
+        if ch != b"\x1b":
+            return ch.decode("utf-8", "ignore")
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not r:
+            return "\x1b"
+        ch2 = os.read(sys.stdin.fileno(), 1)
+        if ch2 != b"[":
+            return ch2.decode("utf-8", "ignore")
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not r:
+            return "\x1b"
+        ch3 = os.read(sys.stdin.fileno(), 1)
+        return {"A": "up", "B": "down"}.get(ch3.decode("utf-8", "ignore"))
     except (OSError, ValueError):
         time.sleep(timeout)
         return None
@@ -591,18 +745,47 @@ def panel_header(show_sizes, show_iv):
     return " ".join(t.rjust(w) for t, w in cols)
 
 
-def straddle_max_loss(orders, atm_limits):
-    if orders:
-        total = Decimal(0)
-        for o in orders.values():
-            px = dec(o.get("avg")) or dec(o.get("price_d"))
-            if px is None:
-                return None
-            total += px
-        return total
-    if atm_limits and all(x is not None for x in atm_limits):
-        return sum(atm_limits, Decimal(0))
-    return None
+def construction_lines(cfg, series, tickers, index, step, selected):
+    if step == 0:
+        k = atm_strike(series, index)
+        legs = (series.by_strike[k]["C"], series.by_strike[k]["P"])
+        desc = f"Стреддл {k:,}"
+        k_low = k_high = Decimal(k)
+        note = "экспирация на страйке"
+    else:
+        sp = strangle_strikes(series, index, step)
+        if sp is None:
+            return []
+        k_p, k_c = sp
+        legs = (series.by_strike[k_c]["C"], series.by_strike[k_p]["P"])
+        desc = f"Стренгл ±{step} P {k_p:,}/C {k_c:,}"
+        k_low, k_high = Decimal(k_p), Decimal(k_c)
+        note = "экспирация между страйками"
+    sel = clr("c", "► ") if selected else "  "
+    head = (clr("b", desc) if selected else desc) + " " * max(1, DESC_W - len(desc))
+    ts = [tickers.get(leg.symbol) for leg in legs]
+    if not all(t and t["ask"] is not None for t in ts):
+        return ["", f"{sel}{head}" + clr("y", "стоимости и Short/Long: — (нет аска по плечам)")]
+    market_cost = ts[0]["ask"] + ts[1]["ask"]
+    tick = legs[0].tick
+    lims = [limit_price(leg, t)[0] for leg, t in zip(legs, ts)]
+    if all(p is not None for p in lims):
+        lim_cost = lims[0] + lims[1]
+        lim_txt = clr("b", fmt_price(lim_cost, tick))
+    else:
+        lim_cost = None
+        lim_txt = "—"
+    lines = ["", f"{sel}{head}рын. {clr('b', fmt_price(market_cost, tick))} / макс. лимит {lim_txt} USDT"]
+    if lim_cost is None:
+        lines.append(clr("y", "Short/Long и Макс. убыток: — (лимит без пересечения спреда невозможен)"))
+        return lines
+    target = lim_cost * TP_MULT
+    lines.append(f"Short order (SELL {cfg.base}): {clr('o', f'{k_high + target:,.2f}')}   "
+                 f"Long order (BUY {cfg.base}): {clr('o', f'{k_low - target:,.2f}')}   "
+                 "фикс. +20% к лимитной стоимости")
+    lines.append(f"Макс. убыток ({note}, 1 {cfg.base}): "
+                 f"{BOLD_RED}{fmt_price(lim_cost, tick)}{RESET} USDT")
+    return lines
 
 
 def render(cfg, state, series):
@@ -615,6 +798,7 @@ def render(cfg, state, series):
         orders = {k: dict(v) for k, v in state.orders.items()}
         placed = state.placed
         follow = state.follow
+        constr_idx = state.constr_idx
         messages = list(state.messages)
     L = []
     mode = (clr("r", clr("b", "LIVE")) if cfg.live else clr("y", clr("b", "DRY-RUN"))) + \
@@ -637,7 +821,7 @@ def render(cfg, state, series):
                  f"{clr('g', 'ВКЛ') if follow else clr('d', 'выкл')}")
         strike = atm_strike(series, index)
         i = series.strikes.index(strike)
-        max_rows = max(3, min(2 * cfg.strikes + 1, lines - 12))
+        max_rows = max(3, min(2 * cfg.strikes + 1, lines - 22))
         half = min(cfg.strikes, (max_rows - 1) // 2)
         window = series.strikes[max(0, i - half):i + half + 1]
         sep = clr("d", "│")
@@ -650,32 +834,8 @@ def render(cfg, state, series):
             L.append(panel_row(cl, tickers.get(cl.symbol), s == strike, show_sizes, show_iv)
                      + sep
                      + panel_row(pl, tickers.get(pl.symbol), s == strike, show_sizes, show_iv))
-        cl = series.by_strike[strike]["C"]
-        pl = series.by_strike[strike]["P"]
-        tc, tp = tickers.get(cl.symbol), tickers.get(pl.symbol)
-        if tc and tp and tc["mark"] is not None and tp["mark"] is not None:
-            smark = tc["mark"] + tp["mark"]
-            pcs, _ = limit_price(cl, tc)
-            pps, _ = limit_price(pl, tp)
-            L.append("")
-            summary = f"Корзина (Σ марок): {clr('c', fmt_price(smark, cl.tick))} USDT"
-            if pcs is not None and pps is not None:
-                total = pcs + pps
-                over = total - smark
-                pct = (over / smark * 100) if smark > 0 else Decimal(0)
-                sign = "+" if over >= 0 else "−"
-                summary += f"   Лимит (Σ заявок): {fmt_price(total, cl.tick)} USDT " \
-                           f"({sign}{abs(pct):.2f}% к марке)"
-            else:
-                summary += clr("y", "   лимит без пересечения спреда сейчас невозможен")
-            L.append(summary)
-            max_loss = straddle_max_loss(
-                orders, (pcs, pps) if pcs is not None and pps is not None else None)
-            if max_loss is not None:
-                L.append(f"Макс. убыток (экспирация на страйке, 1 {cfg.base}): "
-                         f"{BOLD_RED}{fmt_price(max_loss, cl.tick)}{RESET} USDT")
-            else:
-                L.append(clr("y", "Макс. убыток: — (лимит без пересечения спреда невозможен)"))
+        for n, (step, _) in enumerate(CONSTRUCTIONS):
+            L += construction_lines(cfg, series, tickers, index, step, n == constr_idx)
     if orders:
         L.append("")
         for lid, o in sorted(orders.items()):
@@ -690,7 +850,7 @@ def render(cfg, state, series):
                 stc = "r"
             else:
                 stc = "y"
-            L.append(f" {clr(stc, st)}  {o.get('symbol')}  BUY {o.get('qty')} @ {o.get('price')}{fill}{rej}")
+            L.append(f" {clr(stc, st)}  {o.get('symbol')}  BUY {o.get('qty')} @ {o.get('price') or 'рынок'}{fill}{rej}")
     if messages:
         L.append("")
         for ts, kind, text in messages[-2:]:
@@ -698,9 +858,9 @@ def render(cfg, state, series):
             L.append(f" {clr('d', ts)}  {clr(color, text)}")
     keys = "ESC — отменить ордера   q — выход"
     if placed:
-        keys = "f — следование ВКЛ/ВЫКЛ   u — обновить цены   " + keys
+        keys = "ПРОБЕЛ — лимит → рынок   f — следование ВКЛ/ВЫКЛ   u — обновить цены   " + keys
     else:
-        keys = "ПРОБЕЛ — выставить   " + keys
+        keys = "↑/↓ — конструкция   ПРОБЕЛ — лимит (2× — рынок)   " + keys
     L.append("")
     L.append(clr("b", keys))
     out = "\r\n".join(line + "\033[K" for line in L)
@@ -779,13 +939,28 @@ def main():
     with Term():
         last = 0.0
         last_reconcile = time.monotonic()
+        pending_space = None
         while True:
             key = read_key(0.15)
             if key == " " and not state.placed:
-                do_place(cfg, state, series, http)
+                if pending_space is not None and \
+                        time.monotonic() - pending_space < DOUBLE_SPACE_SEC:
+                    pending_space = None
+                    do_market_entry(cfg, state, series, http)
+                else:
+                    pending_space = time.monotonic()
+            elif key == " ":
+                do_market_replace(cfg, state, http, legs)
+            elif key in ("up", "down"):
+                if state.placed:
+                    state.msg("info", "конструкция уже выбрана")
+                else:
+                    with state.lock:
+                        state.constr_idx = (state.constr_idx +
+                                            (1 if key == "down" else -1)) % len(CONSTRUCTIONS)
             elif key in ("f", "F"):
                 if not state.placed:
-                    state.msg("err", "стредд не выставлен — сначала ПРОБЕЛ")
+                    state.msg("err", "конструкция не выставлена — сначала ПРОБЕЛ")
                 elif active_orders(state):
                     state.follow = not state.follow
                     state.msg("info", "следование вкл" if state.follow else "следование выкл")
@@ -794,12 +969,17 @@ def main():
             elif key in ("u", "U"):
                 do_update(cfg, state, http, legs)
             elif key == "\x1b":
+                pending_space = None
                 if state.follow:
                     state.follow = False
                     state.msg("info", "следование выкл")
                 do_cancel_own(cfg, state, http)
             elif key in ("q", "Q", "\x03"):
                 break
+            if pending_space is not None and not state.placed and \
+                    time.monotonic() - pending_space >= DOUBLE_SPACE_SEC:
+                pending_space = None
+                do_place(cfg, state, series, http)
             if state.follow:
                 do_follow_tick(cfg, state, http, legs)
             if cfg.live and time.monotonic() - last_reconcile >= RECONCILE_PERIOD:
