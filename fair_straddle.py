@@ -358,7 +358,7 @@ def apply_order_update(cfg, state, d):
                 state.msg("info", f"{sym} частично исполнена{fill}")
             elif st in ("Cancelled", "PartiallyFilledCanceled"):
                 state.msg("info", f"{sym} отменена (исполнено {o['filled'] or 0})")
-                if state.tg:
+                if state.tg and not o.get("local_cancel"):
                     state.tg.reply([lid], f"❌ Ордер отменён\n{sym}\nисполнено {o.get('filled') or 0}")
             elif st == "Rejected":
                 state.msg("err", f"{sym} отклонена: {o['reject']}")
@@ -586,9 +586,13 @@ def do_cancel_own(cfg, state, http):
     for lid, o in orders.items():
         if o.get("status") in TERMINAL_STATUSES:
             continue
+        with state.lock:
+            state.orders[lid]["local_cancel"] = True
         try:
             http.cancel_order(category="option", symbol=o["symbol"], orderLinkId=lid)
         except Exception as e:
+            with state.lock:
+                state.orders[lid].pop("local_cancel", None)
             if order_gone(str(e)):
                 state.msg("info", f"{lid}: уже не активен (исполнен или снят)")
                 with state.lock:
@@ -599,6 +603,7 @@ def do_cancel_own(cfg, state, http):
             state.msg("ok", f"{lid}: отменён ({o['symbol']})")
             with state.lock:
                 state.orders[lid]["status"] = "Cancelled"
+                state.orders[lid].pop("local_cancel", None)
             cancelled.append((lid, o))
     if cancelled and state.tg:
         lines = ["🚫 Отменены ордера"]
@@ -700,9 +705,13 @@ def do_market_replace(cfg, state, http, legs):
         failed = False
         cancelled = []
         for lid, o in sorted(act.items()):
+            with state.lock:
+                state.orders[lid]["local_cancel"] = True
             try:
                 http.cancel_order(category="option", symbol=o["symbol"], orderLinkId=lid)
             except Exception as e:
+                with state.lock:
+                    state.orders[lid].pop("local_cancel", None)
                 if order_gone(str(e)):
                     state.msg("info", f"{lid}: уже не активен (исполнен или снят)")
                     with state.lock:
@@ -713,6 +722,7 @@ def do_market_replace(cfg, state, http, legs):
             else:
                 with state.lock:
                     state.orders[lid]["status"] = "Cancelled"
+                    state.orders[lid].pop("local_cancel", None)
                 cancelled.append((lid, o))
         if cancelled and state.tg:
             lines = ["♻️ Отменены лимитные ордера"]
