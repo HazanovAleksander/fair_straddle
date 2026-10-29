@@ -298,13 +298,13 @@ def on_ticker(state, msg):
         state.msg("err", f"ws tickers: {e!r}")
 
 
-def on_order(state, msg):
+def on_order(cfg, state, msg):
     try:
         data = msg.get("data") or []
         if isinstance(data, dict):
             data = [data]
         for d in data:
-            apply_order_update(state, d)
+            apply_order_update(cfg, state, d)
     except Exception as e:
         state.msg("err", f"ws order: {e!r}")
 
@@ -328,13 +328,18 @@ def assembly_summary(state):
     return "\n".join(lines)
 
 
-def apply_order_update(state, d):
+def apply_order_update(cfg, state, d):
     with state.lock:
         lid = d.get("orderLinkId")
         if lid not in state.orders:
-            return
+            oid = d.get("orderId")
+            lid = next((l for l, o in state.orders.items()
+                        if o.get("order_id") and o.get("order_id") == oid), None)
+            if lid is None:
+                return
         o = state.orders[lid]
         o["symbol"] = d.get("symbol") or o.get("symbol")
+        o["order_id"] = d.get("orderId") or o.get("order_id") or ""
         prev = o.get("status")
         o["status"] = d.get("orderStatus") or o.get("status")
         o["avg"] = d.get("avgPrice") or o.get("avg")
@@ -367,6 +372,7 @@ def apply_order_update(state, d):
                 if state.tg:
                     state.tg.send(assembly_summary(state))
     refresh_placed(state)
+    save_state(cfg, state)
 
 
 def atm_strike(series, index):
@@ -450,22 +456,27 @@ def do_place(cfg, state, series, http):
                 "symbol": leg.symbol, "tick": str(leg.tick),
                 "price": fmt_price(p, tick), "price_d": str(p),
                 "qty": fmt_qty(cfg.qty, leg.qty_step), "qty_d": str(cfg.qty),
-                "type": "Limit",
+                "type": "Limit", "order_id": "",
                 "status": "Отправлен…" if cfg.live else "DRY — не отправлен",
-                "avg": "", "filled": "", "reject": "",
+                "avg": "", "filled": "", "reject": "", "fee": "",
             }
         state.placed = True
     if not cfg.live:
         return
     for lid, (leg, p, _) in zip((f"{base_lid}c", f"{base_lid}p"), plan):
         try:
-            http.place_order(
+            r = http.place_order(
                 category="option", symbol=leg.symbol, side="Buy", orderType="Limit",
                 qty=str(cfg.qty), price=str(p), timeInForce="GTC", orderLinkId=lid)
         except Exception as e:
             state.msg("err", f"place {leg.symbol}: {e!r}")
             with state.lock:
                 state.orders[lid]["status"] = "ОШИБКА"
+        else:
+            oid = ((r or {}).get("result") or {}).get("orderId") or ""
+            with state.lock:
+                state.orders[lid]["order_id"] = oid
+    save_state(cfg, state)
 
 
 TERMINAL_STATUSES = {"Filled", "Cancelled", "Rejected", "Deactivated",
@@ -478,6 +489,76 @@ RECONCILE_PERIOD = 5.0
 def order_gone(exc_text):
     lowered = exc_text.lower()
     return any(m.lower() in lowered for m in GONE_MARKERS)
+
+
+def state_path(cfg):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        f".state_{cfg.base}.json")
+
+
+def save_state(cfg, state):
+    if not cfg.live:
+        return
+    with state.lock:
+        if not state.orders:
+            return
+        active = any(o.get("status") not in TERMINAL_STATUSES
+                     for o in state.orders.values())
+        snap = {
+            "base": cfg.base,
+            "orders": dict(state.orders),
+            "placed": state.placed,
+            "follow": state.follow,
+            "assembled": state.assembled,
+            "market_done": state.market_done,
+            "constr_idx": state.constr_idx,
+        }
+        if state.tg:
+            snap["tg_msg_ids"], snap["tg_lid_tags"] = state.tg.links()
+    path = state_path(cfg)
+    try:
+        if active:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snap, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        else:
+            os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        state.msg("err", f"save state: {e!r}")
+
+
+def load_state(cfg, state):
+    if not cfg.live:
+        return
+    try:
+        with open(state_path(cfg), encoding="utf-8") as f:
+            snap = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        state.msg("err", f"load state: {e!r}")
+        return
+    orders = snap.get("orders")
+    if snap.get("base") != cfg.base or not isinstance(orders, dict) or not orders:
+        return
+    try:
+        constr_idx = int(snap.get("constr_idx") or 0)
+    except (TypeError, ValueError):
+        constr_idx = 0
+    with state.lock:
+        state.orders = orders
+        state.placed = bool(snap.get("placed"))
+        state.follow = bool(snap.get("follow"))
+        state.assembled = bool(snap.get("assembled"))
+        state.market_done = bool(snap.get("market_done"))
+        state.constr_idx = constr_idx % len(CONSTRUCTIONS)
+    if state.tg:
+        state.tg.set_links(snap.get("tg_msg_ids") or {}, snap.get("tg_lid_tags") or {})
+    active = sum(1 for o in orders.values() if o.get("status") not in TERMINAL_STATUSES)
+    state.msg("ok", f"Восстановлено ордеров: {len(orders)} (активных {active}) — статусы уточняются")
 
 
 def refresh_placed(state):
@@ -524,6 +605,7 @@ def do_cancel_own(cfg, state, http):
         for lid, o in cancelled:
             lines.append(f"BUY {o.get('qty')} {o.get('symbol')} (id {lid})")
         state.tg.reply([lid for lid, _ in cancelled], "\n".join(lines))
+    save_state(cfg, state)
     refresh_placed(state)
 
 
@@ -542,9 +624,9 @@ def place_market(cfg, state, http, items):
                 "symbol": leg.symbol, "tick": str(leg.tick),
                 "price": "", "price_d": "",
                 "qty": fmt_qty(qty, leg.qty_step), "qty_d": str(qty),
-                "type": "Market",
+                "type": "Market", "order_id": "",
                 "status": "Отправлен…" if cfg.live else "DRY — не отправлен",
-                "avg": "", "filled": "", "reject": "",
+                "avg": "", "filled": "", "reject": "", "fee": "",
             }
         state.placed = True
         state.market_done = True
@@ -558,13 +640,18 @@ def place_market(cfg, state, http, items):
         return
     for lid, leg, qty in placed:
         try:
-            http.place_order(
+            r = http.place_order(
                 category="option", symbol=leg.symbol, side="Buy", orderType="Market",
                 qty=str(qty), orderLinkId=lid)
         except Exception as e:
             state.msg("err", f"place market {leg.symbol}: {e!r}")
             with state.lock:
                 state.orders[lid]["status"] = "ОШИБКА"
+        else:
+            oid = ((r or {}).get("result") or {}).get("orderId") or ""
+            with state.lock:
+                state.orders[lid]["order_id"] = oid
+    save_state(cfg, state)
 
 
 def do_market_entry(cfg, state, series, http):
@@ -632,6 +719,7 @@ def do_market_replace(cfg, state, http, legs):
             for lid, o in cancelled:
                 lines.append(f"BUY {o.get('qty')} {o.get('symbol')} (id {lid})")
             state.tg.reply([lid for lid, _ in cancelled], "\n".join(lines))
+        save_state(cfg, state)
         if failed:
             state.msg("err", "конвертация прервана: не все лимитные ордера отменены")
             return
@@ -672,6 +760,7 @@ def do_amend(cfg, state, http, lid, o, p):
             state.msg("info", f"{lid}: уже не активен (исполнен или снят)")
             with state.lock:
                 state.orders[lid]["status"] = "Не найден"
+            save_state(cfg, state)
         else:
             state.msg("err", f"amend {o['symbol']}: {e!r}")
         return
@@ -679,6 +768,7 @@ def do_amend(cfg, state, http, lid, o, p):
         state.orders[lid]["price"] = fmt_price(p, tick)
         state.orders[lid]["price_d"] = str(p)
     state.msg("info", f"{o['symbol']}: репрайс {o['price']} → {fmt_price(p, tick)}")
+    save_state(cfg, state)
 
 
 def do_follow_tick(cfg, state, http, legs):
@@ -737,15 +827,19 @@ def do_update(cfg, state, http, legs):
 def reconcile_orders(cfg, state, http):
     for lid, o in active_orders(state).items():
         try:
-            r = http.get_open_orders(category="option", symbol=o["symbol"],
-                                     orderLinkId=lid, openOnly=0)
+            if o.get("order_id"):
+                r = http.get_open_orders(category="option", symbol=o["symbol"],
+                                         orderId=o["order_id"], openOnly=0)
+            else:
+                r = http.get_open_orders(category="option", symbol=o["symbol"],
+                                         orderLinkId=lid, openOnly=0)
         except Exception as e:
             state.msg("err", f"reconcile {lid}: {e!r}")
             continue
         if r.get("retCode") != 0:
             continue
         for d in r["result"].get("list", []):
-            apply_order_update(state, d)
+            apply_order_update(cfg, state, d)
 
 
 def seed_tickers(state, http, cfg, series):
@@ -1057,6 +1151,7 @@ def main():
             state.msg("info", "Telegram-уведомления включены")
         else:
             state.msg("info", "Telegram: нет TELEGRAM_BOT_TOKEN/TELEGRAM_CHANNEL_ID — уведомления выкл")
+        load_state(cfg, state)
     print(f"Подключение к ByBit ({'testnet' if a.testnet else 'mainnet'})…", flush=True)
     http = HTTP(testnet=a.testnet, timeout=10,
                 api_key=api_key or None, api_secret=api_secret or None)
@@ -1090,12 +1185,15 @@ def main():
             state.msg("err", f"баланс: {e!r}")
         priv = WebSocket(testnet=a.testnet, channel_type="private",
                          api_key=api_key, api_secret=api_secret)
-        priv.order_stream(lambda m: on_order(state, m))
+        priv.order_stream(lambda m: on_order(cfg, state, m))
 
     legs = {leg.symbol: leg for s in series.by_strike.values() for leg in s.values()}
+    if cfg.live and any(o.get("symbol") not in legs for o in active_orders(state).values()):
+        state.msg("err", "восстановленные ордера вне выбранной серии — статусы "
+                         "отслеживаются, follow/репрайс/конвертация недоступны")
     with Term():
         last = 0.0
-        last_reconcile = time.monotonic()
+        last_reconcile = 0.0
         pending_space = None
         while True:
             key = read_key(0.15)
