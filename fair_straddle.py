@@ -257,6 +257,7 @@ def apply_order_update(state, d):
                 state.assembled = True
                 state.follow = False
                 state.msg("ok", "конструкция собрана — следование выкл")
+    refresh_placed(state)
 
 
 def atm_strike(series, index):
@@ -364,6 +365,18 @@ def order_gone(exc_text):
     return any(m.lower() in lowered for m in GONE_MARKERS)
 
 
+def refresh_placed(state):
+    with state.lock:
+        if not state.placed or state.assembled:
+            return
+        if any(o.get("status") not in TERMINAL_STATUSES for o in state.orders.values()):
+            return
+        state.placed = False
+        state.market_done = False
+        state.follow = False
+    state.msg("info", "все ордера завершены — можно выбрать новую конструкцию")
+
+
 def do_cancel_own(cfg, state, http):
     if not cfg.live:
         state.msg("err", "dry-run: отмена недоступна (нет ордеров на бирже)")
@@ -389,6 +402,7 @@ def do_cancel_own(cfg, state, http):
             state.msg("ok", f"{lid}: отменён ({o['symbol']})")
             with state.lock:
                 state.orders[lid]["status"] = "Cancelled"
+    refresh_placed(state)
 
 
 def place_market(cfg, state, http, items):
