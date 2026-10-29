@@ -61,25 +61,56 @@ class TelegramNotifier:
         self.url = f"https://api.telegram.org/bot{token}/sendMessage"
         self.chat_id = chat_id
         self.state = state
+        self.lock = threading.Lock()
         self.queue = queue.Queue()
+        self.lid_tags = {}
+        self.msg_ids = {}
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def send(self, text):
-        self.queue.put(text)
+    def send(self, text, tag=None, lids=()):
+        self.queue.put({"text": text, "tag": tag, "lids": tuple(lids), "reply": ()})
 
-    def _post(self, text):
-        payload = json.dumps({"chat_id": self.chat_id, "text": text}).encode("utf-8")
+    def reply(self, lids, text):
+        self.queue.put({"text": text, "tag": None, "lids": (), "reply": tuple(lids)})
+
+    def set_links(self, msg_ids, lid_tags):
+        with self.lock:
+            self.msg_ids.update(msg_ids)
+            self.lid_tags.update(lid_tags)
+
+    def links(self):
+        with self.lock:
+            return dict(self.msg_ids), dict(self.lid_tags)
+
+    def _post(self, text, reply_to):
+        payload = {"chat_id": self.chat_id, "text": text}
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+            payload["allow_sending_without_reply"] = True
         req = urllib.request.Request(
-            self.url, data=payload, headers={"Content-Type": "application/json"})
+            self.url, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as r:
-            r.read()
+            data = json.loads(r.read())
+            return (data.get("result") or {}).get("message_id")
 
     def _worker(self):
         while True:
-            text = self.queue.get()
+            item = self.queue.get()
+            reply_to = None
+            if item["reply"]:
+                with self.lock:
+                    tags = {self.lid_tags.get(lid) for lid in item["reply"]}
+                    if len(tags) == 1:
+                        reply_to = self.msg_ids.get(next(iter(tags)))
             for attempt in (0, 1):
                 try:
-                    self._post(text)
+                    mid = self._post(item["text"], reply_to)
+                    if item["tag"] and mid:
+                        with self.lock:
+                            self.msg_ids[item["tag"]] = mid
+                            for lid in item["lids"]:
+                                self.lid_tags[lid] = item["tag"]
                     break
                 except Exception as e:
                     if attempt:
@@ -282,7 +313,7 @@ def assembly_summary(state):
     with state.lock:
         orders = [dict(o) for o in state.orders.values()
                   if o.get("status") not in ("Cancelled", "PartiallyFilledCanceled", "Не найден")]
-    lines = ["Конструкция собрана"]
+    lines = ["🧩 Конструкция собрана"]
     premium = fees = Decimal(0)
     for o in orders:
         avg = dec(o.get("avg")) or Decimal(0)
@@ -317,13 +348,13 @@ def apply_order_update(state, d):
             if st == "Filled":
                 state.msg("ok", f"{sym} исполнена{fill}")
                 if state.tg:
-                    state.tg.send(f"Ордер исполнен\n{sym}\nBUY {o.get('qty')} @ {o.get('avg')}")
+                    state.tg.reply([lid], f"✅ Ордер исполнен\n{sym}\nBUY {o.get('qty')} @ {o.get('avg')}")
             elif st == "PartiallyFilled":
                 state.msg("info", f"{sym} частично исполнена{fill}")
             elif st in ("Cancelled", "PartiallyFilledCanceled"):
                 state.msg("info", f"{sym} отменена (исполнено {o['filled'] or 0})")
                 if state.tg:
-                    state.tg.send(f"Ордер отменён\n{sym}\nисполнено {o.get('filled') or 0}")
+                    state.tg.reply([lid], f"❌ Ордер отменён\n{sym}\nисполнено {o.get('filled') or 0}")
             elif st == "Rejected":
                 state.msg("err", f"{sym} отклонена: {o['reject']}")
         if st == "Filled" and not state.assembled and state.orders:
@@ -408,11 +439,11 @@ def do_place(cfg, state, series, http):
                   f"[{tag}] BUY {fmt_qty(cfg.qty, leg.qty_step)} {leg.symbol} лимит {fmt_price(p, tick)} (id {base_lid}{suffix})")
     state.msg("info", f"Σ лимит {fmt_price(total, tick)} против Σ марок {fmt_price(basket_mark, tick)}")
     if state.tg:
-        lines = [f"Выставлены лимитные ордера ({CONSTRUCTIONS[constr][1]}, {series.label()})"]
+        lines = [f"📤 Выставлены лимитные ордера ({CONSTRUCTIONS[constr][1]})"]
         for suffix, (leg, p, _) in zip(("c", "p"), plan):
             lines.append(f"BUY {fmt_qty(cfg.qty, leg.qty_step)} {leg.symbol} лимит {fmt_price(p, tick)}")
         lines.append(f"Σ лимит {fmt_price(total, tick)} USDT")
-        state.tg.send("\n".join(lines))
+        state.tg.send("\n".join(lines), tag=base_lid, lids=(f"{base_lid}c", f"{base_lid}p"))
     with state.lock:
         for suffix, (leg, p, _) in zip(("c", "p"), plan):
             state.orders[f"{base_lid}{suffix}"] = {
@@ -489,10 +520,10 @@ def do_cancel_own(cfg, state, http):
                 state.orders[lid]["status"] = "Cancelled"
             cancelled.append((lid, o))
     if cancelled and state.tg:
-        lines = ["Отменены ордера"]
+        lines = ["🚫 Отменены ордера"]
         for lid, o in cancelled:
             lines.append(f"BUY {o.get('qty')} {o.get('symbol')} (id {lid})")
-        state.tg.send("\n".join(lines))
+        state.tg.reply([lid for lid, _ in cancelled], "\n".join(lines))
     refresh_placed(state)
 
 
@@ -519,10 +550,10 @@ def place_market(cfg, state, http, items):
         state.market_done = True
         state.follow = False
     if state.tg:
-        lines = ["Выставлены рыночные ордера"]
+        lines = ["🚀 Выставлены рыночные ордера"]
         for lid, leg, qty in placed:
             lines.append(f"BUY {fmt_qty(qty, leg.qty_step)} {leg.symbol}")
-        state.tg.send("\n".join(lines))
+        state.tg.send("\n".join(lines), tag=base_lid, lids=tuple(lid for lid, _, _ in placed))
     if not cfg.live:
         return
     for lid, leg, qty in placed:
@@ -597,10 +628,10 @@ def do_market_replace(cfg, state, http, legs):
                     state.orders[lid]["status"] = "Cancelled"
                 cancelled.append((lid, o))
         if cancelled and state.tg:
-            lines = ["Отменены лимитные ордера"]
+            lines = ["♻️ Отменены лимитные ордера"]
             for lid, o in cancelled:
                 lines.append(f"BUY {o.get('qty')} {o.get('symbol')} (id {lid})")
-            state.tg.send("\n".join(lines))
+            state.tg.reply([lid for lid, _ in cancelled], "\n".join(lines))
         if failed:
             state.msg("err", "конвертация прервана: не все лимитные ордера отменены")
             return
