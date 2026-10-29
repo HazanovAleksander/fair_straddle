@@ -157,6 +157,7 @@ class State:
         self.assembled = False
         self.constr_idx = 0
         self.market_done = False
+        self.tp_notified = False
         self.tg = None
 
     def msg(self, kind, text):
@@ -326,6 +327,60 @@ def assembly_summary(state):
     lines.append(f"Комиссии: {fees:.2f} USDT")
     lines.append(f"Итого с комиссиями: {premium + fees:.2f} USDT")
     return "\n".join(lines)
+
+
+def construction_pnl(state):
+    with state.lock:
+        if not state.assembled:
+            return None
+        orders = [dict(o) for o in state.orders.values()
+                  if o.get("status") not in ("Cancelled", "PartiallyFilledCanceled", "Не найден")]
+        tickers = dict(state.tickers)
+    if not orders or not all(o.get("status") == "Filled" for o in orders):
+        return None
+    premium = fees = value = Decimal(0)
+    have_bids = True
+    legs = []
+    for o in orders:
+        avg = dec(o.get("avg"))
+        qty = dec(o.get("filled"))
+        fee = dec(o.get("fee"))
+        if avg is None or qty is None:
+            return None
+        premium += avg * qty
+        fees += fee or Decimal(0)
+        bid = (tickers.get(o.get("symbol")) or {}).get("bid")
+        if bid is None:
+            have_bids = False
+        else:
+            value += bid * qty
+        legs.append((o.get("symbol"), o.get("qty"), avg, bid))
+    cost = premium + fees
+    if cost <= 0:
+        return None
+    return {"cost": cost, "value": value if have_bids else None, "legs": legs}
+
+
+def check_tp(cfg, state):
+    if not state.assembled or state.tp_notified:
+        return
+    p = construction_pnl(state)
+    if p is None or p["value"] is None or p["value"] < p["cost"] * TP_MULT:
+        return
+    with state.lock:
+        state.tp_notified = True
+    pct = (p["value"] / p["cost"] - 1) * 100
+    pnl = p["value"] - p["cost"]
+    state.msg("ok", f"цель +20% достигнута: по бидам {p['value']:.2f} USDT ({pct:+.1f}%)")
+    if state.tg:
+        lines = ["🎯 Прибыль +20% достигнута"]
+        for sym, qty, avg, bid in p["legs"]:
+            lines.append(f"{sym}: BUY {qty} @ {avg} → бид {bid}")
+        lines.append(f"Себестоимость: {p['cost']:.2f} USDT (с комиссиями)")
+        lines.append(f"По бидам: {p['value']:.2f} USDT")
+        lines.append(f"Прибыль: {pnl:+.2f} USDT ({pct:+.1f}%)")
+        state.tg.send("\n".join(lines))
+    save_state(cfg, state)
 
 
 def apply_order_update(cfg, state, d):
@@ -512,6 +567,7 @@ def save_state(cfg, state):
             "assembled": state.assembled,
             "market_done": state.market_done,
             "constr_idx": state.constr_idx,
+            "tp_notified": state.tp_notified,
         }
         if state.tg:
             snap["tg_msg_ids"], snap["tg_lid_tags"] = state.tg.links()
@@ -554,6 +610,7 @@ def load_state(cfg, state):
         state.follow = bool(snap.get("follow"))
         state.assembled = bool(snap.get("assembled"))
         state.market_done = bool(snap.get("market_done"))
+        state.tp_notified = bool(snap.get("tp_notified"))
         state.constr_idx = constr_idx % len(CONSTRUCTIONS)
     if state.tg:
         state.tg.set_links(snap.get("tg_msg_ids") or {}, snap.get("tg_lid_tags") or {})
@@ -570,6 +627,7 @@ def refresh_placed(state):
         state.placed = False
         state.market_done = False
         state.follow = False
+        state.tp_notified = False
     state.msg("info", "все ордера завершены — можно выбрать новую конструкцию")
 
 
@@ -1088,6 +1146,19 @@ def render(cfg, state, series):
                      + panel_row(pl, tickers.get(pl.symbol), s == strike, show_sizes, show_iv))
         for n, (step, _) in enumerate(CONSTRUCTIONS):
             L += construction_lines(cfg, series, tickers, index, step, n == constr_idx)
+    if state.assembled:
+        p = construction_pnl(state)
+        if p is not None:
+            if p["value"] is not None:
+                pct = (p["value"] / p["cost"] - 1) * 100
+                hit = p["value"] >= p["cost"] * TP_MULT
+                val_txt = f"{p['value']:.2f}"
+                pct_txt = clr("g" if hit else "b", f"{pct:+.1f}%")
+            else:
+                val_txt = pct_txt = "—"
+            L.append("")
+            L.append(f" Конструкция: себест. {clr('b', format(p['cost'], '.2f'))} → "
+                     f"по бидам {clr('b', val_txt)} USDT   P/L {pct_txt} (цель +20%)")
     if orders:
         L.append("")
         for lid, o in sorted(orders.items()):
@@ -1247,6 +1318,7 @@ def main():
                 do_place(cfg, state, series, http)
             if state.follow:
                 do_follow_tick(cfg, state, http, legs)
+            check_tp(cfg, state)
             if cfg.live and time.monotonic() - last_reconcile >= RECONCILE_PERIOD:
                 last_reconcile = time.monotonic()
                 reconcile_orders(cfg, state, http)
