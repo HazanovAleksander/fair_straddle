@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 import argparse
 import getpass
+import json
 import os
+import queue
 import select
 import shutil
 import sys
 import termios
+import threading
 import time
 import tty
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,6 +39,53 @@ TP_MULT = Decimal("1.2")
 DOUBLE_SPACE_SEC = 0.3
 CONSTRUCTIONS = ((0, "Стреддл"), (1, "Стренгл ±1"), (2, "Стренгл ±2"), (3, "Стренгл ±3"))
 DESC_W = 30
+
+
+def load_env(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip("'\"")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
+class TelegramNotifier:
+    def __init__(self, token, chat_id, state):
+        self.url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.chat_id = chat_id
+        self.state = state
+        self.queue = queue.Queue()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def send(self, text):
+        self.queue.put(text)
+
+    def _post(self, text):
+        payload = json.dumps({"chat_id": self.chat_id, "text": text}).encode("utf-8")
+        req = urllib.request.Request(
+            self.url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
+
+    def _worker(self):
+        while True:
+            text = self.queue.get()
+            for attempt in (0, 1):
+                try:
+                    self._post(text)
+                    break
+                except Exception as e:
+                    if attempt:
+                        self.state.msg("err", f"telegram: {e!r}")
+                    else:
+                        time.sleep(1.0)
 
 
 @dataclass(frozen=True)
@@ -75,6 +126,7 @@ class State:
         self.assembled = False
         self.constr_idx = 0
         self.market_done = False
+        self.tg = None
 
     def msg(self, kind, text):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -226,6 +278,25 @@ def on_order(state, msg):
         state.msg("err", f"ws order: {e!r}")
 
 
+def assembly_summary(state):
+    with state.lock:
+        orders = [dict(o) for o in state.orders.values()
+                  if o.get("status") not in ("Cancelled", "PartiallyFilledCanceled", "Не найден")]
+    lines = ["Конструкция собрана"]
+    premium = fees = Decimal(0)
+    for o in orders:
+        avg = dec(o.get("avg")) or Decimal(0)
+        qty = dec(o.get("filled")) or Decimal(0)
+        fee = dec(o.get("fee")) or Decimal(0)
+        premium += avg * qty
+        fees += fee
+        lines.append(f"BUY {o.get('qty')} {o.get('symbol')} @ {o.get('avg')}")
+    lines.append(f"Премия: {premium:.2f} USDT")
+    lines.append(f"Комиссии: {fees:.2f} USDT")
+    lines.append(f"Итого с комиссиями: {premium + fees:.2f} USDT")
+    return "\n".join(lines)
+
+
 def apply_order_update(state, d):
     with state.lock:
         lid = d.get("orderLinkId")
@@ -237,6 +308,7 @@ def apply_order_update(state, d):
         o["status"] = d.get("orderStatus") or o.get("status")
         o["avg"] = d.get("avgPrice") or o.get("avg")
         o["filled"] = d.get("cumExecQty") or o.get("filled")
+        o["fee"] = d.get("cumExecFee") or o.get("fee") or ""
         o["reject"] = d.get("rejectReason") or ""
         st = o["status"]
         sym = o["symbol"]
@@ -244,10 +316,14 @@ def apply_order_update(state, d):
         if st != prev:
             if st == "Filled":
                 state.msg("ok", f"{sym} исполнена{fill}")
+                if state.tg:
+                    state.tg.send(f"Ордер исполнен\n{sym}\nBUY {o.get('qty')} @ {o.get('avg')}")
             elif st == "PartiallyFilled":
                 state.msg("info", f"{sym} частично исполнена{fill}")
             elif st in ("Cancelled", "PartiallyFilledCanceled"):
                 state.msg("info", f"{sym} отменена (исполнено {o['filled'] or 0})")
+                if state.tg:
+                    state.tg.send(f"Ордер отменён\n{sym}\nисполнено {o.get('filled') or 0}")
             elif st == "Rejected":
                 state.msg("err", f"{sym} отклонена: {o['reject']}")
         if st == "Filled" and not state.assembled and state.orders:
@@ -257,6 +333,8 @@ def apply_order_update(state, d):
                 state.assembled = True
                 state.follow = False
                 state.msg("ok", "конструкция собрана — следование выкл")
+                if state.tg:
+                    state.tg.send(assembly_summary(state))
     refresh_placed(state)
 
 
@@ -329,6 +407,12 @@ def do_place(cfg, state, series, http):
         state.msg("ok" if cfg.live else "info",
                   f"[{tag}] BUY {fmt_qty(cfg.qty, leg.qty_step)} {leg.symbol} лимит {fmt_price(p, tick)} (id {base_lid}{suffix})")
     state.msg("info", f"Σ лимит {fmt_price(total, tick)} против Σ марок {fmt_price(basket_mark, tick)}")
+    if state.tg:
+        lines = [f"Выставлены лимитные ордера ({CONSTRUCTIONS[constr][1]}, {series.label()})"]
+        for suffix, (leg, p, _) in zip(("c", "p"), plan):
+            lines.append(f"BUY {fmt_qty(cfg.qty, leg.qty_step)} {leg.symbol} лимит {fmt_price(p, tick)}")
+        lines.append(f"Σ лимит {fmt_price(total, tick)} USDT")
+        state.tg.send("\n".join(lines))
     with state.lock:
         for suffix, (leg, p, _) in zip(("c", "p"), plan):
             state.orders[f"{base_lid}{suffix}"] = {
@@ -383,6 +467,7 @@ def do_cancel_own(cfg, state, http):
         return
     with state.lock:
         orders = {lid: dict(o) for lid, o in state.orders.items()}
+    cancelled = []
     if not orders:
         state.msg("info", "нет ордеров приложения")
         return
@@ -402,6 +487,12 @@ def do_cancel_own(cfg, state, http):
             state.msg("ok", f"{lid}: отменён ({o['symbol']})")
             with state.lock:
                 state.orders[lid]["status"] = "Cancelled"
+            cancelled.append((lid, o))
+    if cancelled and state.tg:
+        lines = ["Отменены ордера"]
+        for lid, o in cancelled:
+            lines.append(f"BUY {o.get('qty')} {o.get('symbol')} (id {lid})")
+        state.tg.send("\n".join(lines))
     refresh_placed(state)
 
 
@@ -427,6 +518,11 @@ def place_market(cfg, state, http, items):
         state.placed = True
         state.market_done = True
         state.follow = False
+    if state.tg:
+        lines = ["Выставлены рыночные ордера"]
+        for lid, leg, qty in placed:
+            lines.append(f"BUY {fmt_qty(qty, leg.qty_step)} {leg.symbol}")
+        state.tg.send("\n".join(lines))
     if not cfg.live:
         return
     for lid, leg, qty in placed:
@@ -484,6 +580,7 @@ def do_market_replace(cfg, state, http, legs):
         state.msg("info", "[DRY] лимитные ордера заменены рыночными")
     else:
         failed = False
+        cancelled = []
         for lid, o in sorted(act.items()):
             try:
                 http.cancel_order(category="option", symbol=o["symbol"], orderLinkId=lid)
@@ -498,6 +595,12 @@ def do_market_replace(cfg, state, http, legs):
             else:
                 with state.lock:
                     state.orders[lid]["status"] = "Cancelled"
+                cancelled.append((lid, o))
+        if cancelled and state.tg:
+            lines = ["Отменены лимитные ордера"]
+            for lid, o in cancelled:
+                lines.append(f"BUY {o.get('qty')} {o.get('symbol')} (id {lid})")
+            state.tg.send("\n".join(lines))
         if failed:
             state.msg("err", "конвертация прервана: не все лимитные ордера отменены")
             return
@@ -914,6 +1017,15 @@ def main():
             sys.exit("Пустые ключи API — выход")
 
     state = State()
+    load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    if a.live:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        chat_id = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
+        if token and chat_id:
+            state.tg = TelegramNotifier(token, chat_id, state)
+            state.msg("info", "Telegram-уведомления включены")
+        else:
+            state.msg("info", "Telegram: нет TELEGRAM_BOT_TOKEN/TELEGRAM_CHANNEL_ID — уведомления выкл")
     print(f"Подключение к ByBit ({'testnet' if a.testnet else 'mainnet'})…", flush=True)
     http = HTTP(testnet=a.testnet, timeout=10,
                 api_key=api_key or None, api_secret=api_secret or None)
